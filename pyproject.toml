@@ -1,0 +1,26 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "car-listing-data-pipeline"
+version = "0.1.0"
+description = "Standalone Drom scraping and dataset preparation pipeline."
+authors = [{ name = "Ruslan" }]
+readme = "README.md"
+requires-python = "~=3.13.0"
+classifiers = [
+  "Programming Language :: Python :: 3",
+]
+
+[tool.ruff]
+line-length = 99
+src = ["car_listing_data_pipeline"]
+include = ["pyproject.toml", "car_listing_data_pipeline/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["car_listing_data_pipeline"]
+force-sort-within-sections = true
