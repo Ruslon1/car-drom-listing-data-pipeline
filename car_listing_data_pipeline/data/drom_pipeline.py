@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,6 @@ PARSE_VERSION_META = "drom_meta_v1"
 PARSE_VERSION_VALIDATE = "drom_validate_v1"
 PARSE_VERSION_FILTER_CONTENT = "drom_filter_content_v1"
 PARSE_VERSION_DEDUP = "drom_dedup_v1"
-PARSE_VERSION_MANIFEST = "drom_manifest_v1"
 
 
 def _clean_value(value: Any) -> Any:
@@ -71,6 +71,16 @@ def _to_int(value: Any) -> int | None:
 def _as_url(base_url: str, path: str | None, fallback: str) -> str:
     target = path or fallback
     return urljoin(base_url, target)
+
+
+def _build_image_id(
+    class_id: Any,
+    image_path: Any,
+    image_slot: int,
+    source_url: Any,
+) -> str:
+    payload = f"{class_id}|{image_path}|{image_slot}|{source_url or ''}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
 
 
 def _discovery_request(
@@ -1044,99 +1054,140 @@ def dedup(
     return output_df
 
 
+def _to_image_level_manifest(
+    source: pd.DataFrame,
+    default_split: str = "unsplit",
+) -> pd.DataFrame:
+    if source.empty:
+        return source.copy()
+
+    if "image_path" in source.columns:
+        out = source.copy()
+
+        if "image_id" not in out.columns:
+            out["image_id"] = None
+
+        missing_image_id = out["image_id"].apply(lambda value: _clean_optional(value) is None)
+        if bool(missing_image_id.any()):
+            out.loc[missing_image_id, "image_id"] = out.loc[missing_image_id].apply(
+                lambda row: _build_image_id(
+                    class_id=row.get("class_id"),
+                    image_path=row.get("image_path"),
+                    image_slot=_to_int(row.get("image_slot")) or 0,
+                    source_url=row.get("url"),
+                ),
+                axis=1,
+            )
+
+        if "split" not in out.columns:
+            out["split"] = default_split
+        else:
+            out["split"] = out["split"].apply(
+                lambda value: _clean_optional(value) or default_split
+            )
+
+        return out
+
+    image_rows: list[dict[str, Any]] = []
+    for row in source.to_dict(orient="records"):
+        for image_slot in (1, 2):
+            image_path = row.get(f"image_{image_slot}_path")
+            if image_path is None or pd.isna(image_path):
+                continue
+
+            class_id = row.get("class_id")
+            image_id = _build_image_id(
+                class_id=class_id,
+                image_path=image_path,
+                image_slot=image_slot,
+                source_url=row.get("url"),
+            )
+
+            image_rows.append(
+                {
+                    "image_id": image_id,
+                    "source": row.get("source", "drom"),
+                    "url": row.get("url"),
+                    "scraped_at": row.get("scraped_at", utc_now_iso()),
+                    "make": row.get("make"),
+                    "model": row.get("model"),
+                    "body_type": row.get("body_type"),
+                    "generation": row.get("generation"),
+                    "year": row.get("year"),
+                    "class_name": row.get("class_name"),
+                    "class_id": class_id,
+                    "image_path": image_path,
+                    "image_slot": image_slot,
+                    "image_phash": row.get(f"image_{image_slot}_phash"),
+                    "width": row.get(f"image_{image_slot}_width"),
+                    "height": row.get(f"image_{image_slot}_height"),
+                    "bytes": row.get(f"image_{image_slot}_bytes"),
+                    "format": row.get(f"image_{image_slot}_format"),
+                    "split": default_split,
+                    "car_detected": row.get(f"image_{image_slot}_car_detected"),
+                    "car_conf": row.get(f"image_{image_slot}_car_conf"),
+                    "car_bbox_x1": row.get(f"image_{image_slot}_car_bbox_x1"),
+                    "car_bbox_y1": row.get(f"image_{image_slot}_car_bbox_y1"),
+                    "car_bbox_x2": row.get(f"image_{image_slot}_car_bbox_x2"),
+                    "car_bbox_y2": row.get(f"image_{image_slot}_car_bbox_y2"),
+                    "car_bbox_area_ratio": row.get(f"image_{image_slot}_car_bbox_area_ratio"),
+                    "exterior_score": row.get(f"image_{image_slot}_exterior_score"),
+                    "interior_score": row.get(f"image_{image_slot}_interior_score"),
+                    "content_label": row.get(f"image_{image_slot}_content_label"),
+                    "content_keep": row.get(f"image_{image_slot}_content_keep"),
+                    "content_reason": row.get(f"image_{image_slot}_content_reason"),
+                    "content_error": row.get(f"image_{image_slot}_content_error"),
+                }
+            )
+
+    return pd.DataFrame(image_rows)
+
+
 def prepare_manifest(
     paths: PipelinePaths,
     logger: logging.Logger,
     metrics: DromMetrics,
     include_duplicates: bool = False,
 ) -> pd.DataFrame:
-    dedup_df = read_table(paths.dedup_path, required=True)
-    if dedup_df.empty:
-        logger.warning("Dedup input is empty", extra={"path": paths.dedup_path.as_posix()})
-        write_table(dedup_df, paths.manifest_path)
-        return dedup_df
+    source_df = read_table(paths.dedup_path, required=False)
+    source_path = paths.dedup_path
 
-    working = dedup_df.copy()
+    if source_df.empty and not paths.dedup_path.exists():
+        fallback_df = read_table(paths.manifest_path, required=False)
+        if fallback_df.empty:
+            raise FileNotFoundError(f"Table not found: {paths.dedup_path}")
+        source_df = fallback_df
+        source_path = paths.manifest_path
+        logger.warning(
+            "Dedup input missing; rebuilding manifest from existing manifest input",
+            extra={
+                "dedup_path": paths.dedup_path.as_posix(),
+                "fallback_path": paths.manifest_path.as_posix(),
+            },
+        )
+
+    if source_df.empty:
+        logger.warning("Manifest source input is empty", extra={"path": source_path.as_posix()})
+        write_table(source_df, paths.manifest_path)
+        return source_df
+
+    working = source_df.copy()
     if "is_duplicate" in working.columns and not include_duplicates:
         working = working[~working["is_duplicate"]].copy()
 
     if "is_valid" in working.columns:
         working = working[working["is_valid"]].copy()
 
-    manifest = pd.DataFrame(
-        {
-            "listing_id": working["listing_id"].astype(str),
-            "source": working.get("source", "drom"),
-            "url": working.get("url"),
-            "scraped_at": working.get("scraped_at", utc_now_iso()),
-            "make": working.get("make"),
-            "model": working.get("model"),
-            "body_type": working.get("body_type"),
-            "generation": working.get("generation"),
-            "year": working.get("year"),
-            "class_name": working.get("class_name"),
-            "class_id": working.get("class_id"),
-            "image_1_path": working.get("image_1_path"),
-            "image_2_path": working.get("image_2_path"),
-            "image_1_phash": working.get("image_1_phash"),
-            "image_2_phash": working.get("image_2_phash"),
-            "width": working.get("image_1_width"),
-            "height": working.get("image_1_height"),
-            "bytes": working.get("image_1_bytes"),
-            "format": working.get("image_1_format"),
-            "split": "unsplit",
-            "http_status": working.get("http_status"),
-            "parse_version": PARSE_VERSION_MANIFEST,
-            "meta_error": working.get("meta_error"),
-            "fetch_images_error": working.get("fetch_images_error"),
-            "validation_error": working.get("validation_error"),
-            "is_duplicate": working.get("is_duplicate", False),
-            "duplicate_of_listing_id": working.get("duplicate_of_listing_id"),
-            "duplicate_reason": working.get("duplicate_reason"),
-            "image_1_width": working.get("image_1_width"),
-            "image_1_height": working.get("image_1_height"),
-            "image_1_bytes": working.get("image_1_bytes"),
-            "image_1_format": working.get("image_1_format"),
-            "image_2_width": working.get("image_2_width"),
-            "image_2_height": working.get("image_2_height"),
-            "image_2_bytes": working.get("image_2_bytes"),
-            "image_2_format": working.get("image_2_format"),
-            "content_filter_keep": working.get("content_filter_keep"),
-            "content_filter_pass_images": working.get("content_filter_pass_images"),
-            "content_filter_reason": working.get("content_filter_reason"),
-            "content_filter_error": working.get("content_filter_error"),
-            "content_filter_version": working.get("content_filter_version"),
-            "image_1_car_detected": working.get("image_1_car_detected"),
-            "image_1_car_conf": working.get("image_1_car_conf"),
-            "image_1_car_bbox_x1": working.get("image_1_car_bbox_x1"),
-            "image_1_car_bbox_y1": working.get("image_1_car_bbox_y1"),
-            "image_1_car_bbox_x2": working.get("image_1_car_bbox_x2"),
-            "image_1_car_bbox_y2": working.get("image_1_car_bbox_y2"),
-            "image_1_car_bbox_area_ratio": working.get("image_1_car_bbox_area_ratio"),
-            "image_1_exterior_score": working.get("image_1_exterior_score"),
-            "image_1_interior_score": working.get("image_1_interior_score"),
-            "image_1_content_label": working.get("image_1_content_label"),
-            "image_1_content_keep": working.get("image_1_content_keep"),
-            "image_1_content_reason": working.get("image_1_content_reason"),
-            "image_1_content_error": working.get("image_1_content_error"),
-            "image_2_car_detected": working.get("image_2_car_detected"),
-            "image_2_car_conf": working.get("image_2_car_conf"),
-            "image_2_car_bbox_x1": working.get("image_2_car_bbox_x1"),
-            "image_2_car_bbox_y1": working.get("image_2_car_bbox_y1"),
-            "image_2_car_bbox_x2": working.get("image_2_car_bbox_x2"),
-            "image_2_car_bbox_y2": working.get("image_2_car_bbox_y2"),
-            "image_2_car_bbox_area_ratio": working.get("image_2_car_bbox_area_ratio"),
-            "image_2_exterior_score": working.get("image_2_exterior_score"),
-            "image_2_interior_score": working.get("image_2_interior_score"),
-            "image_2_content_label": working.get("image_2_content_label"),
-            "image_2_content_keep": working.get("image_2_content_keep"),
-            "image_2_content_reason": working.get("image_2_content_reason"),
-            "image_2_content_error": working.get("image_2_content_error"),
-        }
-    )
+    manifest = _to_image_level_manifest(working, default_split="unsplit")
+    if manifest.empty:
+        logger.warning("Manifest output is empty after image-level flattening")
+        write_table(manifest, paths.manifest_path)
+        return manifest
 
-    manifest = manifest.drop_duplicates(subset=["listing_id", "class_id"], keep="last")
-    manifest = manifest.sort_values(by=["class_id", "listing_id"], kind="stable").reset_index(
+    manifest = manifest.copy()
+    manifest["split"] = "unsplit"
+    manifest = manifest.drop_duplicates(subset=["image_id"], keep="last")
+    manifest = manifest.sort_values(by=["class_id", "image_id"], kind="stable").reset_index(
         drop=True
     )
     write_table(manifest, paths.manifest_path)
@@ -1179,30 +1230,44 @@ def split_manifest(
     if val_ratio < 0 or test_ratio < 0 or (val_ratio + test_ratio) >= 1:
         raise ValueError("val_ratio and test_ratio must be >=0 and sum to <1")
 
-    per_listing = manifest[["listing_id", "class_id"]].drop_duplicates(
-        subset=["listing_id"]
-    )  # one key
-    per_listing = per_listing.reset_index(drop=True)
+    if "image_id" not in manifest.columns:
+        logger.warning(
+            "Legacy manifest format detected; converting to image-level before split",
+            extra={"manifest_path": paths.manifest_path.as_posix()},
+        )
+        manifest = _to_image_level_manifest(manifest, default_split="unsplit")
+        if manifest.empty:
+            logger.warning("Manifest is empty after image-level conversion")
+            write_table(manifest, paths.manifest_path)
+            return manifest
 
-    if len(per_listing) < 3:
+    if "image_id" not in manifest.columns:
+        raise ValueError("Manifest must contain image_id column for split stage")
+
+    per_image = manifest[["image_id", "class_id"]].drop_duplicates(
+        subset=["image_id"]
+    )
+    per_image = per_image.reset_index(drop=True)
+
+    if len(per_image) < 3:
         manifest = manifest.copy()
         manifest["split"] = "train"
         write_table(manifest, paths.manifest_path)
         return manifest
 
     test_val_ratio = val_ratio + test_ratio
-    labels = per_listing["class_id"]
+    labels = per_image["class_id"]
 
     stratify_labels = labels if _can_stratify(labels, min_count=2) else None
     train_keys, temp_keys = train_test_split(
-        per_listing,
+        per_image,
         test_size=test_val_ratio,
         random_state=seed,
         stratify=stratify_labels,
     )
 
     if temp_keys.empty:
-        split_map = {key: "train" for key in train_keys["listing_id"]}
+        split_map = {key: "train" for key in train_keys["image_id"]}
     else:
         temp_val_ratio = val_ratio / test_val_ratio if test_val_ratio > 0 else 0.5
         temp_labels = temp_keys["class_id"]
@@ -1215,13 +1280,13 @@ def split_manifest(
             stratify=temp_stratify,
         )
 
-        split_map = {key: "train" for key in train_keys["listing_id"]}
-        split_map.update({key: "val" for key in val_keys["listing_id"]})
-        split_map.update({key: "test" for key in test_keys["listing_id"]})
+        split_map = {key: "train" for key in train_keys["image_id"]}
+        split_map.update({key: "val" for key in val_keys["image_id"]})
+        split_map.update({key: "test" for key in test_keys["image_id"]})
 
     out = manifest.copy()
-    out["split"] = out["listing_id"].map(split_map).fillna("train")
-    out = out.sort_values(by=["split", "class_id", "listing_id"], kind="stable").reset_index(
+    out["split"] = out["image_id"].map(split_map).fillna("train")
+    out = out.sort_values(by=["split", "class_id", "image_id"], kind="stable").reset_index(
         drop=True
     )
 
