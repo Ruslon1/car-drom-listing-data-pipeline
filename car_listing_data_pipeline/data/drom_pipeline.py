@@ -1058,6 +1058,8 @@ def _to_image_level_manifest(
     source: pd.DataFrame,
     default_split: str = "unsplit",
 ) -> pd.DataFrame:
+    excluded_columns = ["content_keep", "content_reason", "content_error"]
+
     if source.empty:
         return source.copy()
 
@@ -1086,6 +1088,7 @@ def _to_image_level_manifest(
                 lambda value: _clean_optional(value) or default_split
             )
 
+        out = out.drop(columns=excluded_columns, errors="ignore")
         return out
 
     image_rows: list[dict[str, Any]] = []
@@ -1134,13 +1137,12 @@ def _to_image_level_manifest(
                     "exterior_score": row.get(f"image_{image_slot}_exterior_score"),
                     "interior_score": row.get(f"image_{image_slot}_interior_score"),
                     "content_label": row.get(f"image_{image_slot}_content_label"),
-                    "content_keep": row.get(f"image_{image_slot}_content_keep"),
-                    "content_reason": row.get(f"image_{image_slot}_content_reason"),
-                    "content_error": row.get(f"image_{image_slot}_content_error"),
                 }
             )
 
-    return pd.DataFrame(image_rows)
+    out = pd.DataFrame(image_rows)
+    out = out.drop(columns=excluded_columns, errors="ignore")
+    return out
 
 
 def prepare_manifest(
@@ -1185,6 +1187,7 @@ def prepare_manifest(
         return manifest
 
     manifest = manifest.copy()
+    manifest = manifest.drop(columns=["content_keep", "content_reason", "content_error"], errors="ignore")
     manifest["split"] = "unsplit"
     manifest = manifest.drop_duplicates(subset=["image_id"], keep="last")
     manifest = manifest.sort_values(by=["class_id", "image_id"], kind="stable").reset_index(
