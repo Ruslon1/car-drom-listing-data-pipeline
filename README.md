@@ -29,6 +29,8 @@ Run full pipeline:
 make drom-run-all
 ```
 
+Manifest format is image-level: one row per image (`image_path`), not listing-level pairs.
+
 Stage-by-stage:
 
 ```bash
@@ -42,30 +44,16 @@ make drom-manifest
 make drom-split
 ```
 
-## Hugging Face release and upload
-
-Build release folder:
-
-```bash
-make hf-release
-```
-
-Upload (single pass):
-
-```bash
-make hf-upload DATASET_REPO=<hf-user>/<dataset-name> HF_UPLOAD_WORKERS=4
-```
-
-Upload in resilient batches (recommended for slow internet):
-
-```bash
-make hf-upload-batch DATASET_REPO=<hf-user>/<dataset-name> HF_UPLOAD_WORKERS=4
-```
-
 ## Config
 
 - Class/source config file: `configs/classes.yaml`
 - CLI entrypoint: `python3 -m car_listing_data_pipeline.data.drom`
+
+## Dataset
+
+Prebuilt dataset is available on Hugging Face:
+
+- https://huggingface.co/datasets/ruslon/drom-car-listings-99-classes
 
 ## Compliance
 
