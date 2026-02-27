@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from car_listing_data_pipeline.config import PROJ_ROOT
+from car_listing_data_pipeline.config import DATA_DIR, PROJ_ROOT
 from car_listing_data_pipeline.data.drom_utils import read_table, write_table
 
 SUPPORTED_FILE_MODES = {"hardlink", "copy", "symlink"}
@@ -32,6 +33,7 @@ def prepare_hf_release(
         "Publication and usage are allowed only under an explicit agreement with drom.ru."
     ),
     file_mode: str = "hardlink",
+    exterior_only: bool = True,
     force: bool = False,
 ) -> dict[str, Any]:
     mode = file_mode.strip().lower()
@@ -39,18 +41,12 @@ def prepare_hf_release(
         allowed = ", ".join(sorted(SUPPORTED_FILE_MODES))
         raise ValueError(f"Unsupported file_mode={file_mode!r}; expected one of: {allowed}")
 
-    manifest = read_table(manifest_path, required=True)
-    if manifest.empty:
+    manifest_raw = read_table(manifest_path, required=True)
+    if manifest_raw.empty:
         raise ValueError(f"Manifest is empty: {manifest_path}")
 
-    required_columns = {
-        "listing_id",
-        "class_id",
-        "class_name",
-        "split",
-        "image_1_path",
-        "image_2_path",
-    }
+    manifest = _to_image_manifest(manifest_raw)
+    required_columns = {"image_id", "class_id", "class_name", "split", "image_path"}
     missing = sorted(required_columns - set(manifest.columns))
     if missing:
         raise ValueError(f"Manifest is missing required columns: {', '.join(missing)}")
@@ -58,106 +54,102 @@ def prepare_hf_release(
     output_dir = output_dir.resolve()
     if force and output_dir.exists():
         shutil.rmtree(output_dir)
+    if exterior_only and output_dir.exists() and not force:
+        raise ValueError(
+            "exterior_only export requires force=True when output_dir already exists. "
+            "Re-run with --force to avoid stale interior files in hf_release."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_records: list[dict[str, Any]] = []
-    listing_records: list[dict[str, Any]] = []
 
     images_created = 0
     images_reused = 0
     missing_source_images = 0
+    interior_images_skipped = 0
 
     for row in manifest.to_dict(orient="records"):
-        listing_id = str(row.get("listing_id"))
+        image_id = _to_str(row.get("image_id")) or _build_image_id(
+            class_id=row.get("class_id"),
+            image_path=row.get("image_path"),
+            image_slot=row.get("image_slot"),
+            source_url=row.get("url"),
+        )
         class_id = _to_int(row.get("class_id"))
         class_name = _normalize_class_name(row.get("class_name"), class_id=class_id)
         split_original = _to_str(row.get("split")) or "train"
         split_hf = _normalize_split(split_original)
 
-        listing_row = dict(row)
-        listing_row["split_original"] = split_original
-        listing_row["split_hf"] = split_hf
-        listing_row["image_1_file_name"] = None
-        listing_row["image_2_file_name"] = None
+        if exterior_only and not _is_exterior_row(row=row):
+            interior_images_skipped += 1
+            continue
 
-        for image_slot in (1, 2):
-            source_value = row.get(f"image_{image_slot}_path")
-            source_path = _resolve_source_path(source_value)
-            if source_path is None or not source_path.exists():
-                missing_source_images += 1
-                continue
+        source_path = _resolve_source_path(row.get("image_path"))
+        if source_path is None or not source_path.exists():
+            missing_source_images += 1
+            continue
 
-            destination_relative = (
-                Path("images") / split_hf / class_name / f"{listing_id}_{image_slot}.jpg"
-            )
-            destination_path = output_dir / destination_relative
-            status = _materialize_image(
-                source_path=source_path,
-                destination_path=destination_path,
-                mode=mode,
-            )
-            if status == "created":
-                images_created += 1
-            else:
-                images_reused += 1
+        suffix = source_path.suffix.lower() or ".jpg"
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = ".jpg"
 
-            destination_value = destination_relative.as_posix()
-            listing_row[f"image_{image_slot}_file_name"] = destination_value
+        destination_relative = Path("images") / split_hf / class_name / f"{image_id}{suffix}"
+        destination_path = output_dir / destination_relative
+        status = _materialize_image(
+            source_path=source_path,
+            destination_path=destination_path,
+            mode=mode,
+        )
+        if status == "created":
+            images_created += 1
+        else:
+            images_reused += 1
 
-            image_records.append(
-                {
-                    "listing_id": listing_id,
-                    "class_id": class_id,
-                    "class_name": class_name,
-                    "make": row.get("make"),
-                    "model": row.get("model"),
-                    "generation": row.get("generation"),
-                    "body_type": row.get("body_type"),
-                    "year": row.get("year"),
-                    "source": row.get("source"),
-                    "url": row.get("url"),
-                    "scraped_at": row.get("scraped_at"),
-                    "split": split_hf,
-                    "split_original": split_original,
-                    "image_slot": image_slot,
-                    "image_file_name": destination_value,
-                    "image_phash": row.get(f"image_{image_slot}_phash"),
-                    "image_width": row.get(f"image_{image_slot}_width"),
-                    "image_height": row.get(f"image_{image_slot}_height"),
-                    "image_bytes": row.get(f"image_{image_slot}_bytes"),
-                    "image_format": row.get(f"image_{image_slot}_format"),
-                    "car_detected": row.get(f"image_{image_slot}_car_detected"),
-                    "car_conf": row.get(f"image_{image_slot}_car_conf"),
-                    "car_bbox_x1": row.get(f"image_{image_slot}_car_bbox_x1"),
-                    "car_bbox_y1": row.get(f"image_{image_slot}_car_bbox_y1"),
-                    "car_bbox_x2": row.get(f"image_{image_slot}_car_bbox_x2"),
-                    "car_bbox_y2": row.get(f"image_{image_slot}_car_bbox_y2"),
-                    "car_bbox_area_ratio": row.get(f"image_{image_slot}_car_bbox_area_ratio"),
-                    "exterior_score": row.get(f"image_{image_slot}_exterior_score"),
-                    "interior_score": row.get(f"image_{image_slot}_interior_score"),
-                    "content_label": row.get(f"image_{image_slot}_content_label"),
-                    "content_keep": row.get(f"image_{image_slot}_content_keep"),
-                    "content_reason": row.get(f"image_{image_slot}_content_reason"),
-                    "content_error": row.get(f"image_{image_slot}_content_error"),
-                    "http_status": row.get("http_status"),
-                    "parse_version": row.get("parse_version"),
-                }
-            )
-
-        listing_records.append(listing_row)
+        destination_value = destination_relative.as_posix()
+        image_records.append(
+            {
+                "image_id": image_id,
+                "class_id": class_id,
+                "class_name": class_name,
+                "make": row.get("make"),
+                "model": row.get("model"),
+                "generation": row.get("generation"),
+                "body_type": row.get("body_type"),
+                "year": row.get("year"),
+                "source": row.get("source"),
+                "url": row.get("url"),
+                "scraped_at": row.get("scraped_at"),
+                "split": split_hf,
+                "split_original": split_original,
+                "image_slot": row.get("image_slot"),
+                "image_file_name": destination_value,
+                "image_phash": row.get("image_phash"),
+                "image_width": row.get("width"),
+                "image_height": row.get("height"),
+                "image_bytes": row.get("bytes"),
+                "image_format": row.get("format"),
+                "car_detected": row.get("car_detected"),
+                "car_conf": row.get("car_conf"),
+                "car_bbox_x1": row.get("car_bbox_x1"),
+                "car_bbox_y1": row.get("car_bbox_y1"),
+                "car_bbox_x2": row.get("car_bbox_x2"),
+                "car_bbox_y2": row.get("car_bbox_y2"),
+                "car_bbox_area_ratio": row.get("car_bbox_area_ratio"),
+                "exterior_score": row.get("exterior_score"),
+                "interior_score": row.get("interior_score"),
+                "content_label": row.get("content_label"),
+                "content_keep": row.get("content_keep"),
+                "content_reason": row.get("content_reason"),
+                "content_error": row.get("content_error"),
+            }
+        )
 
     images_df = pd.DataFrame(image_records)
     if images_df.empty:
         raise ValueError("HF export produced zero image rows; check manifest image paths")
 
     images_df = images_df.sort_values(
-        by=["split", "class_id", "listing_id", "image_slot"],
-        kind="stable",
-    ).reset_index(drop=True)
-
-    listings_df = pd.DataFrame(listing_records)
-    listings_df = listings_df.sort_values(
-        by=["class_id", "listing_id"],
+        by=["split", "class_id", "image_id"],
         kind="stable",
     ).reset_index(drop=True)
 
@@ -165,7 +157,6 @@ def prepare_hf_release(
     write_table(images_df[images_df["split"] == "train"], output_dir / "train.parquet")
     write_table(images_df[images_df["split"] == "validation"], output_dir / "validation.parquet")
     write_table(images_df[images_df["split"] == "test"], output_dir / "test.parquet")
-    write_table(listings_df, output_dir / "listings.parquet")
 
     if class_mapping_path.exists():
         class_mapping = read_table(class_mapping_path, required=False)
@@ -176,7 +167,6 @@ def prepare_hf_release(
     class_counts = (
         images_df["class_name"].value_counts(dropna=False).sort_values(ascending=False).to_dict()
     )
-    listing_count = int(listings_df["listing_id"].nunique())
     class_count = int(images_df["class_name"].nunique())
     image_count = int(len(images_df))
 
@@ -186,7 +176,6 @@ def prepare_hf_release(
         license_id=license_id,
         agreement_note=agreement_note,
         image_count=image_count,
-        listing_count=listing_count,
         class_count=class_count,
         split_counts=split_counts,
         class_counts=class_counts,
@@ -201,12 +190,14 @@ def prepare_hf_release(
         "class_mapping_path": class_mapping_path.resolve().as_posix(),
         "output_dir": output_dir.as_posix(),
         "image_count": image_count,
-        "listing_count": listing_count,
+        "record_count": image_count,
         "class_count": class_count,
         "split_counts": split_counts,
         "images_created": images_created,
         "images_reused": images_reused,
         "missing_source_images": missing_source_images,
+        "interior_images_skipped": interior_images_skipped,
+        "exterior_only": exterior_only,
         "file_mode": mode,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -224,7 +215,6 @@ def render_dataset_card(
     license_id: str,
     agreement_note: str,
     image_count: int,
-    listing_count: int,
     class_count: int,
     split_counts: dict[str, int],
     class_counts: dict[str, int],
@@ -280,7 +270,6 @@ ML-ready dataset of authorized car listing images collected from drom.ru under a
 ## Summary
 
 - **Generated at**: `{generated_at}`
-- **Listings**: `{listing_count}`
 - **Images**: `{image_count}`
 - **Classes**: `{class_count}`
 {repo_line}
@@ -295,17 +284,16 @@ ML-ready dataset of authorized car listing images collected from drom.ru under a
 
 - `train.parquet`, `validation.parquet`, `test.parquet`: image-level rows (one image per row).
 - `metadata.parquet`: full image-level table across all splits.
-- `listings.parquet`: listing-level table (two image references per listing).
 - `class_mapping.parquet`: class mapping (`class_id` -> `class_name`) if available.
-- `images/<split>/<class_name>/<listing_id>_<slot>.jpg`: image files.
+- `images/<split>/<class_name>/<image_id>.<ext>`: image files.
 
 ## Image-Level Columns
 
 - `image_file_name` relative path to image file inside this dataset repo
 - `class_id`, `class_name`, `make`, `model`, `generation`, `body_type`, `year`
-- `listing_id`, `source`, `url`, `scraped_at`
+- `image_id`, `source`, `url`, `scraped_at`
 - `split`, `split_original`
-- `image_slot` (`1` or `2`)
+- `image_slot` (optional source slot if present)
 - `image_phash`, `image_width`, `image_height`, `image_bytes`, `image_format`
 - `car_detected`, `car_conf`, `car_bbox_x1`, `car_bbox_y1`, `car_bbox_x2`, `car_bbox_y2`, `car_bbox_area_ratio`
 - `exterior_score`, `interior_score`, `content_label`, `content_keep`, `content_reason`, `content_error`
@@ -347,15 +335,142 @@ def _resolve_source_path(value: Any) -> Path | None:
     if raw is None:
         return None
 
-    source_path = Path(raw)
-    if not source_path.is_absolute():
-        source_path = PROJ_ROOT / source_path
-    return source_path
+    source_path = Path(raw).expanduser()
+    if source_path.is_absolute():
+        return source_path
+
+    candidates: list[Path] = [PROJ_ROOT / source_path]
+    if source_path.parts and source_path.parts[0] == "data":
+        candidates.append(DATA_DIR.parent / source_path)
+    candidates.append(DATA_DIR / source_path)
+
+    seen: set[Path] = set()
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate in seen:
+            continue
+        seen.add(resolved_candidate)
+        unique_candidates.append(resolved_candidate)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+
+    if source_path.parts and source_path.parts[0] == "data":
+        return (DATA_DIR.parent / source_path).resolve()
+    return (PROJ_ROOT / source_path).resolve()
 
 
 def _normalize_split(value: str) -> str:
     split = value.strip().lower()
     return HF_SPLIT_MAP.get(split, "train")
+
+
+def _build_image_id(
+    class_id: Any,
+    image_path: Any,
+    image_slot: Any,
+    source_url: Any,
+) -> str:
+    payload = f"{class_id}|{image_path}|{image_slot}|{source_url or ''}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _is_exterior_row(row: dict[str, Any]) -> bool:
+    label_value = row.get("content_label")
+    keep_value = row.get("content_keep")
+
+    label = _to_str(label_value)
+    if label:
+        return label.lower() == "exterior"
+
+    if keep_value is None or pd.isna(keep_value):
+        return True
+
+    if isinstance(keep_value, bool):
+        return keep_value
+
+    keep_text = _to_str(keep_value)
+    if keep_text is None:
+        return True
+
+    return keep_text.lower() in {"1", "true", "yes", "y"}
+
+
+def _to_image_manifest(manifest: pd.DataFrame) -> pd.DataFrame:
+    if "image_path" in manifest.columns:
+        out = manifest.copy()
+        if "image_id" not in out.columns:
+            out["image_id"] = out.apply(
+                lambda row: _build_image_id(
+                    class_id=row.get("class_id"),
+                    image_path=row.get("image_path"),
+                    image_slot=row.get("image_slot"),
+                    source_url=row.get("url"),
+                ),
+                axis=1,
+            )
+        return out
+
+    legacy_required = {"class_id", "class_name", "split", "image_1_path", "image_2_path"}
+    missing = sorted(legacy_required - set(manifest.columns))
+    if missing:
+        raise ValueError(
+            "Manifest must be image-level or contain legacy columns: "
+            + ", ".join(legacy_required)
+        )
+
+    rows: list[dict[str, Any]] = []
+    for record in manifest.to_dict(orient="records"):
+        for slot in (1, 2):
+            image_path = record.get(f"image_{slot}_path")
+            if image_path is None or pd.isna(image_path):
+                continue
+
+            rows.append(
+                {
+                    "image_id": _build_image_id(
+                        class_id=record.get("class_id"),
+                        image_path=image_path,
+                        image_slot=slot,
+                        source_url=record.get("url"),
+                    ),
+                    "source": record.get("source"),
+                    "url": record.get("url"),
+                    "scraped_at": record.get("scraped_at"),
+                    "make": record.get("make"),
+                    "model": record.get("model"),
+                    "body_type": record.get("body_type"),
+                    "generation": record.get("generation"),
+                    "year": record.get("year"),
+                    "class_name": record.get("class_name"),
+                    "class_id": record.get("class_id"),
+                    "image_path": image_path,
+                    "image_slot": slot,
+                    "image_phash": record.get(f"image_{slot}_phash"),
+                    "width": record.get(f"image_{slot}_width"),
+                    "height": record.get(f"image_{slot}_height"),
+                    "bytes": record.get(f"image_{slot}_bytes"),
+                    "format": record.get(f"image_{slot}_format"),
+                    "split": record.get("split"),
+                    "car_detected": record.get(f"image_{slot}_car_detected"),
+                    "car_conf": record.get(f"image_{slot}_car_conf"),
+                    "car_bbox_x1": record.get(f"image_{slot}_car_bbox_x1"),
+                    "car_bbox_y1": record.get(f"image_{slot}_car_bbox_y1"),
+                    "car_bbox_x2": record.get(f"image_{slot}_car_bbox_x2"),
+                    "car_bbox_y2": record.get(f"image_{slot}_car_bbox_y2"),
+                    "car_bbox_area_ratio": record.get(f"image_{slot}_car_bbox_area_ratio"),
+                    "exterior_score": record.get(f"image_{slot}_exterior_score"),
+                    "interior_score": record.get(f"image_{slot}_interior_score"),
+                    "content_label": record.get(f"image_{slot}_content_label"),
+                    "content_keep": record.get(f"image_{slot}_content_keep"),
+                    "content_reason": record.get(f"image_{slot}_content_reason"),
+                    "content_error": record.get(f"image_{slot}_content_error"),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def _normalize_class_name(value: Any, class_id: int | None) -> str:

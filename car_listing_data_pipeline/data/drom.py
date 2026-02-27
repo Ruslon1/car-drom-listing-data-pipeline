@@ -509,6 +509,11 @@ def prepare_hf_release_cmd(
         "hardlink",
         help="How to materialize images: hardlink|copy|symlink",
     ),
+    exterior_only: bool = typer.Option(
+        True,
+        "--exterior-only/--allow-interior",
+        help="Export only exterior images into HF release.",
+    ),
     force: bool = typer.Option(False, help="Recreate output directory from scratch"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
@@ -523,6 +528,7 @@ def prepare_hf_release_cmd(
         license_id=license_id,
         agreement_note=agreement_note,
         file_mode=file_mode,
+        exterior_only=exterior_only,
         force=force,
     )
 

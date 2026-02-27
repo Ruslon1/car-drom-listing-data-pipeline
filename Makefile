@@ -91,7 +91,7 @@ data: requirements drom-run-all drom-prune-artifacts
 
 .PHONY: hf-release
 hf-release:
-	$(DROM_CLI) prepare-hf-release --manifest-path $(DATA_DIR)/processed/manifest.parquet --class-mapping-path $(DATA_DIR)/processed/class_mapping.parquet --output-dir $(HF_RELEASE_DIR) --dataset-name $(HF_DATASET_NAME) --file-mode $(HF_FILE_MODE) --license-id $(HF_LICENSE)
+	$(DROM_CLI) prepare-hf-release --manifest-path $(DATA_DIR)/processed/manifest.parquet --class-mapping-path $(DATA_DIR)/processed/class_mapping.parquet --output-dir $(HF_RELEASE_DIR) --dataset-name $(HF_DATASET_NAME) --file-mode $(HF_FILE_MODE) --license-id $(HF_LICENSE) --exterior-only --force
 
 .PHONY: hf-upload
 hf-upload: hf-release
